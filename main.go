@@ -6,7 +6,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -25,6 +24,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,21 +39,21 @@ const (
 
 type identity struct {
 	Address string `json:"address"`
-	Secret  string `json:"secret"`
+	Admin   string `json:"admin"`
 	Cert    []byte `json:"certificate"`
 	Key     []byte `json:"key"`
 }
 
 type invitation struct {
 	Address string `json:"address"`
-	Secret  string `json:"secret"`
 	Cert    []byte `json:"certificate"`
 }
 
 type server struct {
-	root   string
-	secret string
-	mu     sync.Mutex // Device registration and publication share the same limit.
+	root     string
+	adminKey string
+	access   *accessList
+	mu       sync.Mutex // Device registration and publication share the same limit.
 }
 
 func main() {
@@ -66,9 +66,10 @@ func run() error {
 	listen := flag.String("listen", "127.0.0.1:38737", "LAN IP address and port")
 	data := flag.String("data", "", "private server storage directory")
 	version := flag.Bool("version", false, "print server and protocol version")
+	managed := flag.Bool("managed", false, "read the host device credentials from stdin")
 	flag.Parse()
 	if *version {
-		fmt.Println("yap-sync-server 1")
+		fmt.Println("yap-sync-server 2")
 		return nil
 	}
 	address, err := netip.ParseAddrPort(*listen)
@@ -88,6 +89,19 @@ func run() error {
 			return fmt.Errorf("invalid storage directory %s", dir)
 		}
 	}
+	access, err := openAccess(*data)
+	if err != nil {
+		return err
+	}
+	if *managed {
+		var device credentials
+		if err := json.NewDecoder(io.LimitReader(os.Stdin, 1024)).Decode(&device); err != nil || !device.valid() {
+			return errors.New("invalid host device credentials")
+		}
+		if _, err := access.request(device, true); err != nil {
+			return err
+		}
+	}
 	id, err := loadIdentity(*data, address.Addr())
 	if err != nil {
 		return err
@@ -102,12 +116,19 @@ func run() error {
 	}
 	defer listener.Close()
 
-	dataForClient, err := json.Marshal(invitation{listener.Addr().String(), id.Secret, id.Cert})
+	dataForClient, err := json.Marshal(invitation{listener.Addr().String(), id.Cert})
 	if err != nil {
 		return err
 	}
-	fmt.Println("yapsync1." + base64.RawURLEncoding.EncodeToString(dataForClient))
-	s := &server{root: *data, secret: id.Secret}
+	invite := "yapsync2." + base64.RawURLEncoding.EncodeToString(dataForClient)
+	discovery, err := listenDiscovery(address.Addr(), lanName(), invite)
+	if err != nil {
+		log.Printf("LAN discovery unavailable: %v", err)
+	} else if discovery != nil {
+		defer discovery.Close()
+	}
+	fmt.Println(invite)
+	s := &server{root: *data, adminKey: id.Admin, access: access}
 	httpServer := &http.Server{
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -132,25 +153,35 @@ func loadIdentity(root string, ip netip.Addr) (identity, error) {
 	var id identity
 	raw, err := os.ReadFile(path)
 	if err == nil {
-		if err := json.Unmarshal(raw, &id); err != nil || !validHex(id.Secret, 64) {
+		if err := json.Unmarshal(raw, &id); err != nil || len(id.Cert) == 0 || len(id.Key) == 0 {
 			return identity{}, errors.New("invalid server identity file")
 		}
-		if id.Address == ip.String() {
+		if id.Address == ip.String() && validHex(id.Admin, 64) {
 			return id, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return identity{}, err
 	}
-	secret := make([]byte, 32)
+	if !validHex(id.Admin, 64) {
+		admin := make([]byte, 32)
+		if _, err := rand.Read(admin); err != nil {
+			return identity{}, err
+		}
+		id.Admin = hex.EncodeToString(admin)
+	}
+	if id.Address == ip.String() && len(id.Cert) > 0 {
+		raw, err := json.Marshal(id)
+		if err != nil {
+			return identity{}, err
+		}
+		return id, writeAtomic(path, bytes.NewReader(raw))
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return identity{}, err
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return identity{}, err
-	}
-	if _, err := rand.Read(secret); err != nil {
 		return identity{}, err
 	}
 	now := time.Now()
@@ -173,7 +204,7 @@ func loadIdentity(root string, ip netip.Addr) (identity, error) {
 	}
 	id = identity{
 		Address: ip.String(),
-		Secret:  hex.EncodeToString(secret),
+		Admin:   id.Admin,
 		Cert:    pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		Key:     pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private}),
 	}
@@ -188,7 +219,7 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"version":1}`)
+		fmt.Fprint(w, `{"version":1,"access":2}`)
 	})
 	mux.HandleFunc("GET /v1/devices", s.listDevices)
 	mux.HandleFunc("GET /v1/devices/{device}", s.device)
@@ -197,13 +228,23 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/tracks/{digest}", s.track)
 	mux.HandleFunc("PUT /v1/tracks/{digest}", s.track)
 	mux.HandleFunc("POST /v1/tracks/{digest}/repair", s.repair)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.secret)) != 1 {
+	authorized := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Yap-Device")
+		token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !bearer || !s.access.allowed(id, token) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
 		mux.ServeHTTP(w, r)
+	})
+	root := http.NewServeMux()
+	root.HandleFunc("POST /v1/pair", s.pair)
+	root.HandleFunc("GET /v1/admin/devices", s.admin)
+	root.HandleFunc("PUT /v1/admin/devices/{id}", s.admin)
+	root.Handle("/", authorized)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		root.ServeHTTP(w, r)
 	})
 }
 
@@ -227,8 +268,14 @@ func (s *server) listDevices(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "Cannot list devices", http.StatusInternalServerError)
 		return
 	}
+	visible := ids[:0]
+	for _, id := range ids {
+		if s.access.published(id) {
+			visible = append(visible, id)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ids)
+	json.NewEncoder(w).Encode(visible)
 }
 
 func (s *server) device(w http.ResponseWriter, r *http.Request) {
@@ -239,11 +286,19 @@ func (s *server) device(w http.ResponseWriter, r *http.Request) {
 	}
 	path := filepath.Join(s.root, "devices", id)
 	if r.Method != http.MethodPut {
+		if !s.access.published(id) {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		serveFile(w, r, path)
 		return
 	}
 
+	if r.Header.Get("X-Yap-Device") != id {
+		http.Error(w, "Cannot publish another device", http.StatusForbidden)
+		return
+	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxManifest))
 	if err != nil {
 		http.Error(w, "Cannot read manifest", http.StatusBadRequest)
