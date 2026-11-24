@@ -1,0 +1,58 @@
+name: Release YAP Sync Server
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [darwin, linux, windows]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test ./...
+      - name: Build release binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          asset="yap-sync-server-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = "windows" ]; then asset="${asset}.exe"; fi
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/$asset" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yap-sync-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum yap-sync-server-* > SHA256SUMS
+          gh release create "$RELEASE_TAG" yap-sync-server-* SHA256SUMS --verify-tag --generate-notes
